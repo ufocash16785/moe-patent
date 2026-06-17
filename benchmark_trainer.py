@@ -61,6 +61,8 @@ from router_variants import (
     StatefulRouter,
     LoRAMoERouter,
     ContrastiveRouter,
+    BankConstrainedRouter,
+    BankedSparseMoEBlock,
 )
 
 ROUTER_VARIANTS = {
@@ -72,6 +74,7 @@ ROUTER_VARIANTS = {
     "HierarchicalRouter": HierarchicalRouter,
     "StatefulRouter": StatefulRouter,
     "ContrastiveRouter": ContrastiveRouter,
+    # Banked model is NOT a router variant — use --banked flag separately
 }
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
@@ -535,6 +538,260 @@ def run_math(router_cls=None, config=None, verbose=True) -> Tuple[MoETransformer
     return model, metrics
 
 
+# ╔════════════════════════════════════════════════════════════════════════════╗
+# ║  BANKED MODEL — Two‑Phase Training (Shakespeare Bank T → Math Bank M)     ║
+# ╚════════════════════════════════════════════════════════════════════════════╝
+
+def build_banked_model(config: MoEConfig) -> MoETransformer:
+    """
+    Build a MoETransformer but replace every SparseMoEBlock with BankedSparseMoEBlock.
+    The transformer body (embedding, attention, layer norm) stays shared.
+    """
+    model = MoETransformer(config)
+    # Replace each layer's MoE block with the banked version
+    for layer in model.layers:
+        # BankedSparseMoEBlock has its own router + separate bank_t/bank_m experts
+        layer.moe = BankedSparseMoEBlock(config)
+    return model
+
+
+def set_all_banks(model: MoETransformer, bank: Optional[str]):
+    """Propagate active_bank to all MoE layers."""
+    for layer in model.layers:
+        if hasattr(layer.moe, 'set_active_bank'):
+            layer.moe.set_active_bank(bank)
+
+
+def train_benchmark_single_bank(
+    model: MoETransformer,
+    config: MoEConfig,
+    dataset,
+    active_bank: str,
+    is_math: bool = False,
+    math_eval_dataset: Optional[MathDataset] = None,
+    bank_label: str = "T",
+    steps_per_bank: int = None,
+    eval_every: int = 200,
+    verbose: bool = True,
+) -> Dict[str, List]:
+    """
+    Train model with a specific bank active.
+
+    Args:
+      active_bank:  'T' or 'M'
+      bank_label:   'T' or 'M' (for printing)
+      steps_per_bank: if None, uses config.num_steps
+    """
+    set_all_banks(model, active_bank)
+
+    steps = steps_per_bank or config.num_steps
+    old_num_steps = config.num_steps
+    config.num_steps = steps
+
+    from torch.utils.data import DataLoader
+    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+    metrics = {"step": [], "loss": [], "accuracy": [], "aux_loss": []}
+
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=steps, eta_min=1e-5
+    )
+
+    step = 0
+    data_iter = iter(dataloader)
+
+    if verbose:
+        print(f"\n  ── {bank_label} Bank active ({'Shakespeare' if active_bank == 'T' else 'Math'}) ──")
+
+    while step < steps:
+        try:
+            x, y = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            x, y = next(data_iter)
+
+        x, y = x.to(config.device), y.to(config.device)
+        logits, aux_loss = model(x)
+
+        ce_loss = F.cross_entropy(
+            logits.view(-1, config.vocab_size),
+            y.view(-1),
+            ignore_index=0,
+        )
+        total_loss = ce_loss + config.router_aux_loss_coef * aux_loss
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        scheduler.step()
+        step += 1
+
+        if step % eval_every == 0 or step == 1:
+            with torch.no_grad():
+                val_logits, val_aux = model(x)
+                val_ce = F.cross_entropy(
+                    val_logits.view(-1, config.vocab_size),
+                    y.view(-1),
+                    ignore_index=0,
+                )
+                accuracy = compute_accuracy(val_logits, y)
+
+            metrics["step"].append(step)
+            metrics["loss"].append(val_ce.item())
+            metrics["accuracy"].append(accuracy)
+            metrics["aux_loss"].append(val_aux.item())
+
+            if verbose:
+                if is_math:
+                    math_acc = compute_math_accuracy(model, math_eval_dataset, config, 200)
+                    print(f"  [{bank_label}] Step {step:5d} | Loss: {val_ce.item():.4f} | "
+                          f"CharAcc: {accuracy:.4f} | MathAcc: {math_acc:.4f}")
+                else:
+                    perplexity = compute_perplexity(val_ce.item())
+                    print(f"  [{bank_label}] Step {step:5d} | Loss: {val_ce.item():.4f} | "
+                          f"Acc: {accuracy:.4f} | PPL: {perplexity:.2f}")
+
+    config.num_steps = old_num_steps
+    return metrics
+
+
+def run_banked_model(
+    config: MoEConfig = None,
+    shakespeare_steps: int = None,
+    math_steps: int = None,
+    verbose: bool = True,
+) -> Tuple[MoETransformer, Dict, Dict]:
+    """
+    Two‑phase banked MoE training.
+
+    Phase 1 — Shakespeare: Bank T active (experts 0‑3), Bank M zeroed
+    Phase 2 — Math:      Bank M active (experts 4‑7), Bank T zeroed
+
+    Inference (called after both phases): bank constraint active
+      → top‑1 determines bank; top‑2 forced from same bank
+
+    Args:
+      config:           MoEConfig (uses large config if None)
+      shakespeare_steps: training steps for Shakespeare (default = config.num_steps)
+      math_steps:       training steps for Math (default = config.num_steps)
+    """
+    print("\n" + "="*60)
+    print("  Banked MoE — Two‑Phase Training")
+    print("  Phase 1: Shakespeare → Bank T (experts 0‑3)")
+    print("  Phase 2: Math         → Bank M (experts 4‑7)")
+    print("  Inference: bank‑constrained routing")
+    print("="*60)
+
+    if config is None:
+        config = make_large_config(max_seq_len=128)
+
+    if shakespeare_steps is None:
+        shakespeare_steps = config.num_steps
+    if math_steps is None:
+        math_steps = config.num_steps
+
+    # ── Shakespeare data ───────────────────────────────────────────────
+    print("\n[Shakespeare Data]")
+    data = download_shakespeare()
+    print(f"  Dataset size: {len(data):,} bytes")
+    shakespeare_dataset = TinyShakespeareDataset(data, config.max_seq_len, stride=64)
+    print(f"  Samples: {len(shakespeare_dataset):,}")
+
+    # ── Math data ──────────────────────────────────────────────────────
+    print("\n[Math Data]")
+    math_train_dataset = MathDataset(10000, config.max_seq_len, difficulty="medium")
+    math_eval_dataset = MathDataset(500,   config.max_seq_len, difficulty="medium")
+    print(f"  Train: {len(math_train_dataset):,}  |  Eval: {len(math_eval_dataset):,}")
+
+    # ── Build banked model ──────────────────────────────────────────────
+    model = build_banked_model(config).to(config.device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"\n  Total params: {total_params:,}")
+    # Count bank params
+    bank_t_params = sum(p.numel() for layer in model.layers
+                        for p in layer.moe.bank_t.parameters())
+    bank_m_params = sum(p.numel() for layer in model.layers
+                        for p in layer.moe.bank_m.parameters())
+    router_params = sum(p.numel() for layer in model.layers
+                        for p in layer.moe.router.parameters())
+    print(f"  Bank T (4 experts) params: {bank_t_params:,}")
+    print(f"  Bank M (4 experts) params: {bank_m_params:,}")
+    print(f"  Shared router params:      {router_params:,}")
+
+    # ── Phase 1: Shakespeare → Bank T ──────────────────────────────────
+    print("\n[Phase 1 — Shakespeare | Bank T]")
+    sh_metrics = train_benchmark_single_bank(
+        model, config, shakespeare_dataset,
+        active_bank='T',
+        is_math=False,
+        bank_label='T',
+        steps_per_bank=shakespeare_steps,
+        eval_every=200,
+        verbose=verbose,
+    )
+    final_sh_ppl = compute_perplexity(sh_metrics["loss"][-1])
+    final_sh_acc = sh_metrics["accuracy"][-1]
+    print(f"\n  Shakespeare Final → PPL: {final_sh_ppl:.2f} | Acc: {final_sh_acc:.4f}")
+
+    # ── Phase 2: Math → Bank M ─────────────────────────────────────────
+    print("\n[Phase 2 — Math | Bank M]")
+    math_metrics = train_benchmark_single_bank(
+        model, config, math_train_dataset,
+        active_bank='M',
+        is_math=True,
+        math_eval_dataset=math_eval_dataset,
+        bank_label='M',
+        steps_per_bank=math_steps,
+        eval_every=200,
+        verbose=verbose,
+    )
+    final_math_acc = math_metrics["accuracy"][-1]
+
+    # ── Inference: bank‑constrained routing ────────────────────────────
+    set_all_banks(model, None)
+    model.eval()
+    print("\n[Inference — Bank‑Constrained Routing]")
+
+    with torch.no_grad():
+        # Shakespeare perplexity
+        x_sh, y_sh = shakespeare_dataset[0]
+        x_sh = x_sh.unsqueeze(0).to(config.device)
+        logits_sh, _ = model(x_sh)
+        ppl_sh = compute_perplexity(
+            F.cross_entropy(logits_sh.view(-1, 256), y_sh.view(-1), ignore_index=0).item()
+        )
+
+        # Math accuracy
+        math_acc_final = compute_math_accuracy(model, math_eval_dataset, config, 500)
+
+    print(f"  Shakespeare PPL (inference): {ppl_sh:.2f}")
+    print(f"  Math Acc (inference):         {math_acc_final:.4f}")
+
+    # ── Router analysis ───────────────────────────────────────────────
+    print("\n[Router Analysis — Inference Mode]")
+    model.eval()
+    expert_counts = torch.zeros(8)
+    for i in range(20):
+        x, _ = shakespeare_dataset[i % len(shakespeare_dataset)]
+        x = x.unsqueeze(0).to(config.device)
+        hidden = model.token_embedding(x)
+        hidden = model.layers[0].ln2(hidden)
+        with torch.no_grad():
+            _, expert_indices, _ = model.layers[0].moe.router(hidden, active_bank=None)
+        for e in range(8):
+            expert_counts[e] += (expert_indices == e).sum().item()
+
+    print(f"  Expert token counts (top-1, inference): {expert_counts.tolist()}")
+    bank_t_total = expert_counts[:4].sum().item()
+    bank_m_total = expert_counts[4:].sum().item()
+    print(f"  Bank T total: {int(bank_t_total)}  |  Bank M total: {int(bank_m_total)}")
+
+    return model, sh_metrics, math_metrics
+
+
 def run_all_variants(shakespeare_only=False, math_only=False):
     """
     Run both benchmarks with ALL router variants.
@@ -600,9 +857,11 @@ def run_all_variants(shakespeare_only=False, math_only=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MoE Benchmark Trainer")
     parser.add_argument("--router", type=str, default=None,
-                        help="Router class name to use (default: standard MoERouter)")
+                        help="Router class name (default: standard MoERouter)")
     parser.add_argument("--all_variants", action="store_true",
                         help="Run all router variants on both benchmarks")
+    parser.add_argument("--banked", action="store_true",
+                        help="Run two‑phase banked model (Shakespeare→Bank T, Math→Bank M)")
     parser.add_argument("--shakespeare_only", action="store_true")
     parser.add_argument("--math_only", action="store_true")
     parser.add_argument("--d_model", type=int, default=256)
@@ -615,13 +874,25 @@ if __name__ == "__main__":
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    if args.all_variants:
+    if args.banked:
+        # ── Banked two‑phase model ────────────────────────────────────────
+        config = make_large_config(
+            d_model=args.d_model,
+            num_layers=args.num_layers,
+            num_steps=args.num_steps,
+            batch_size=args.batch_size,
+        )
+        config.device = device
+        run_banked_model(config=config)
+
+    elif args.all_variants:
         results = run_all_variants(
             shakespeare_only=args.shakespeare_only,
             math_only=args.math_only,
         )
+
     else:
-        # Determine router
+        # ── Standard model (single‑phase per benchmark) ──────────────────
         router_cls = None
         if args.router:
             if args.router not in ROUTER_VARIANTS:
@@ -634,7 +905,6 @@ if __name__ == "__main__":
         else:
             print("Using standard MoERouter")
 
-        # Config with overrides
         config = make_large_config(
             d_model=args.d_model,
             num_layers=args.num_layers,
