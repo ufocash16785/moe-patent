@@ -62,7 +62,7 @@ from moe_model import MoETransformer
 
 THRESHOLD_EASY_LOSS   = 1e-4   # Shakespeare loss below this → too easy
 THRESHOLD_EASY_ACC    = 0.999  # Shakespeare acc above this → too easy
-PLATEAU_WINDOW        = 3      # eval points to check for plateau (no improvement trigger)
+PLATEAU_WINDOW        = 2      # eval points to check for plateau (2 = check prev eval point)
 PLATEAU_THRESHOLD     = 0.05   # plateau if loss improved < 5% over window
 CONVERGENCE_WINDOW    = 3      # eval points for math oscillation check
 DIVERGENCE_ACC_THRESH = 0.0    # Math acc below this → too hard
@@ -237,10 +237,15 @@ def train_phase(
     is_math: bool = False,
     math_eval_dataset: Optional[MathDataset] = None,
     verbose: bool = True,
-) -> Dict[str, List]:
+    convergence_checker=None,
+) -> Tuple[Dict[str, List], bool]:
     """
-    Train for one phase (Shakespeare or Math) with the current bank config.
-    Returns metrics dict.
+    Train for one phase with the current bank config.
+
+    Returns:
+      (metrics_dict, converged_early):
+        metrics_dict:  {'step':[], 'loss':[], 'accuracy':[], 'aux_loss':[]}
+        converged_early: True if convergence detected during training (early return)
     """
     set_all_banks(model, active_bank)
     model.train()
@@ -255,6 +260,7 @@ def train_phase(
     )
 
     metrics = {"step": [], "loss": [], "accuracy": [], "aux_loss": []}
+    converged_early = False
 
     step = 0
     while step < steps:
@@ -308,7 +314,14 @@ def train_phase(
                     print(f"  {tag} Step {step:5d} | Loss: {val_ce.item():.4f} | "
                           f"Acc: {accuracy:.4f} | PPL: {ppl:.2f}")
 
-    return metrics
+            # ── Early convergence check ────────────────────────────────────
+            if convergence_checker is not None and convergence_checker(metrics):
+                converged_early = True
+                if verbose:
+                    print(f"  ⚡ Early convergence at step {step} — stopping phase")
+                break
+
+    return metrics, converged_early
 
 
 # ╔════════════════════════════════════════════════════════════════════════════╗
@@ -374,12 +387,13 @@ def run_adaptive_trainer(
 
         # ── Phase 1: Train Shakespeare ─────────────────────────────────
         print(f"\n[Phase {phase_num} — Shakespeare | Bank T active]")
-        sh_metrics = train_phase(
+        sh_metrics, sh_early = train_phase(
             model, config, shakespeare_dataset,
             bank_label='T', active_bank='T',
             steps=shakespeare_steps,
             is_math=False,
             verbose=verbose,
+            convergence_checker=is_shakespeare_converged,
         )
         final_sh_loss = sh_metrics["loss"][-1]
         final_sh_acc  = sh_metrics["accuracy"][-1]
@@ -393,9 +407,8 @@ def run_adaptive_trainer(
         sh_converged = is_shakespeare_converged(sh_metrics)
 
         if sh_converged and t_size > min_t_experts:
-            old_loss = final_sh_loss
             worst = find_worst_expert(model, shakespeare_dataset, config, bank_t_experts)
-            print(f"\n  ⚠️  Shakespeare converged! (loss={old_loss:.6f}, plateau/improvement<{PLATEAU_THRESHOLD*100:.0f}%)")
+            print(f"\n  ⚠️  Shakespeare converged! (loss={final_sh_loss:.6f})")
             print(f"  → Moving worst expert {worst} from Bank T → Bank M")
 
             bank_t_experts = [e for e in bank_t_experts if e != worst]
@@ -409,13 +422,14 @@ def run_adaptive_trainer(
 
         # ── Phase 2: Train Math ────────────────────────────────────────
         print(f"\n[Phase {phase_num} — Math | Bank M active]")
-        math_metrics = train_phase(
+        math_metrics, math_early = train_phase(
             model, config, math_train,
             bank_label='M', active_bank='M',
             steps=math_steps,
             is_math=True,
             math_eval_dataset=math_eval,
             verbose=verbose,
+            convergence_checker=is_math_converged,
         )
         final_math_acc = math_metrics["accuracy"][-1]
         final_math_loss = math_metrics["loss"][-1]
@@ -429,7 +443,7 @@ def run_adaptive_trainer(
         math_converged = is_math_converged(math_metrics)
 
         if math_converged and len(bank_t_experts) > 1:
-            print(f"\n  ⚠️  Math converged (plateau/acc=0, improvement<{PLATEAU_THRESHOLD*100:.0f}%)!")
+            print(f"\n  ⚠️  Math converged (plateau/acc=0)!")
             print(f"  → Moving worst Bank T expert → Bank M  (strengthen Bank M for math)")
             worst_t = find_worst_expert(model, shakespeare_dataset, config, bank_t_experts)
             bank_t_experts = [e for e in bank_t_experts if e != worst_t]
