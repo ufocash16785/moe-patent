@@ -110,7 +110,7 @@ def make_large_config(vocab_size: int = 256, max_seq_len: int = 128, **kwargs) -
         num_steps=2000,            # was 200
 
         # ── Device ──────────────────────────────────────────────────
-        device="cpu",
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
     for k, v in kwargs.items():
