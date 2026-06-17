@@ -249,27 +249,35 @@ def compute_accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
 def compute_math_accuracy(model: MoETransformer, dataset: MathDataset,
                            config: MoEConfig, num_samples: int = 200) -> float:
     """
-    Compute exact-string accuracy on math problems.
+    Compute exact-string accuracy on math problems (teacher-forcing, fast).
     A prediction is correct only if the entire output string matches.
+
+    Uses a single forward pass per sample (teacher forcing) — fast on GPU.
     """
     model.eval()
     correct = 0
     total = 0
 
     for i in range(min(num_samples, len(dataset))):
-        x, y = dataset[i]
+        x, y = dataset[i]        # x=[prompt tokens], y=[answer tokens]
         x = x.unsqueeze(0).to(config.device)
-        y = dataset[i][1]  # target bytes
 
-        # Generate
-        output = model.generate(x, max_new=dataset.max_seq_len)
-        pred = output[0, x.size(1):].tolist()
+        # Teacher-forcing: forward pass to get logits for ALL positions
+        logits, _ = model(x)                        # [1, seq_len, vocab]
 
-        # Strip padding (0) and compare
-        pred_str = bytes(pred).rstrip(b'\x00').decode('ascii', errors='ignore')
-        target_str = bytes(y.tolist()).rstrip(b'\x00').decode('ascii', errors='ignore')
+        # Get logits at the answer positions (where y is non-zero / non-pad)
+        y_tensor = torch.as_tensor(y, dtype=torch.long, device=config.device)
+        mask = y_tensor != 0
 
-        if pred_str == target_str:
+        if mask.sum() == 0:
+            continue
+
+        # Predicted tokens
+        preds = logits[0, :len(y), :].argmax(dim=-1)  # [seq_len]
+        preds_masked = preds[mask]
+        targets_masked = y_tensor[mask]
+
+        if (preds_masked == targets_masked).all():
             correct += 1
         total += 1
 
@@ -542,16 +550,22 @@ def run_math(router_cls=None, config=None, verbose=True) -> Tuple[MoETransformer
 # ║  BANKED MODEL — Two‑Phase Training (Shakespeare Bank T → Math Bank M)     ║
 # ╚════════════════════════════════════════════════════════════════════════════╝
 
-def build_banked_model(config: MoEConfig) -> MoETransformer:
+def build_banked_model(config: MoEConfig, bank_t_experts=None, bank_m_experts=None) -> MoETransformer:
     """
     Build a MoETransformer but replace every SparseMoEBlock with BankedSparseMoEBlock.
     The transformer body (embedding, attention, layer norm) stays shared.
+
+    Args:
+      bank_t_experts: list of expert indices for bank T (default: [0,1,2,3])
+      bank_m_experts: list of expert indices for bank M (default: [4,5,6,7])
     """
+    if bank_t_experts is None:
+        bank_t_experts = [0, 1, 2, 3]
+    if bank_m_experts is None:
+        bank_m_experts = [4, 5, 6, 7]
     model = MoETransformer(config)
-    # Replace each layer's MoE block with the banked version
     for layer in model.layers:
-        # BankedSparseMoEBlock has its own router + separate bank_t/bank_m experts
-        layer.moe = BankedSparseMoEBlock(config)
+        layer.moe = BankedSparseMoEBlock(config, bank_t_experts, bank_m_experts)
     return model
 
 
@@ -561,6 +575,11 @@ def set_all_banks(model: MoETransformer, bank: Optional[str]):
         if hasattr(layer.moe, 'set_active_bank'):
             layer.moe.set_active_bank(bank)
 
+
+def update_all_bank_config(model: MoETransformer, bank_t_experts: list, bank_m_experts: list):
+    """Propagate new bank expert assignments to all layers."""
+    for layer in model.layers:
+        layer.moe.update_bank_config(bank_t_experts, bank_m_experts)
 
 def train_benchmark_single_bank(
     model: MoETransformer,

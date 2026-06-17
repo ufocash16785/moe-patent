@@ -62,8 +62,9 @@ from moe_model import MoETransformer
 
 THRESHOLD_EASY_LOSS   = 1e-4   # Shakespeare loss below this → too easy
 THRESHOLD_EASY_ACC    = 0.999  # Shakespeare acc above this → too easy
-PATIENCE_STEPS        = 50     # must hold for this many consecutive steps
-CONVERGENCE_WINDOW    = 30     # window to check loss oscillation for Math
+PLATEAU_WINDOW        = 3      # eval points to check for plateau (no improvement trigger)
+PLATEAU_THRESHOLD     = 0.05   # plateau if loss improved < 5% over window
+CONVERGENCE_WINDOW    = 3      # eval points for math oscillation check
 DIVERGENCE_ACC_THRESH = 0.0    # Math acc below this → too hard
 
 STEPS_PER_PHASE       = 1000   # training steps per phase before checking rebalance
@@ -110,25 +111,36 @@ def count_active_params(model, bank_t_experts: list, bank_m_experts: list) -> in
 # ╚════════════════════════════════════════════════════════════════════════════╝
 
 
-def is_shakespeare_too_easy(metrics: Dict, window: int = None) -> bool:
+def is_shakespeare_converged(metrics: Dict) -> bool:
     """
-    Check if Shakespeare loss has been consistently below THRESHOLD_EASY_LOSS
-    and accuracy above THRESHOLD_EASY_ACC for `window` consecutive eval steps.
+    Shakespeare has converged / plateaued if:
+      (a) loss < THRESHOLD_EASY_LOSS AND acc > THRESHOLD_EASY_ACC,  OR
+      (b) loss has NOT improved by more than PLATEAU_THRESHOLD over PLATEAU_WINDOW evals
     """
-    window = window or PATIENCE_STEPS
     losses = metrics.get("loss", [])
     accs   = metrics.get("accuracy", [])
+    window = PLATEAU_WINDOW
 
-    if len(losses) < window:
+    if len(losses) < 1:
         return False
 
-    recent_losses = losses[-window:]
-    recent_accs   = accs[-window:]
-
+    # Check (a): trivially easy
+    recent_losses = losses[-min(window, len(losses)):]
+    recent_accs   = accs[-min(window, len(accs)):]
     easy_loss = all(l < THRESHOLD_EASY_LOSS for l in recent_losses)
     easy_acc  = all(a > THRESHOLD_EASY_ACC  for a in recent_accs)
+    if easy_loss and easy_acc:
+        return True
 
-    return easy_loss and easy_acc
+    # Check (b): plateau (no significant loss improvement)
+    if len(losses) >= window:
+        window_losses = losses[-window:]
+        oldest = window_losses[0]
+        newest = window_losses[-1]
+        if oldest > 0 and (oldest - newest) / oldest < PLATEAU_THRESHOLD:
+            return True   # improved less than threshold
+
+    return False
 
 
 def is_math_too_hard(metrics: Dict) -> bool:
@@ -144,20 +156,31 @@ def is_math_too_hard(metrics: Dict) -> bool:
     return all(a == 0.0 for a in recent)
 
 
-def is_math_not_converging(metrics: Dict, window: int = None) -> bool:
+def is_math_converged(metrics: Dict) -> bool:
     """
-    Check if loss is oscillating without progress (sign of not converging).
+    Math has converged if:
+      (a) acc stuck at 0 (complete failure),  OR
+      (b) loss has NOT improved by more than PLATEAU_THRESHOLD over PLATEAU_WINDOW evals
     """
-    window = window or CONVERGENCE_WINDOW
     losses = metrics.get("loss", [])
-    if len(losses) < window * 2:
-        return False
+    accs   = metrics.get("accuracy", [])
+    window = CONVERGENCE_WINDOW
 
-    recent = losses[-window*2:]
-    # Simple check: variance of differences doesn't decrease
-    diffs = [abs(recent[i] - recent[i+1]) for i in range(len(recent)-1)]
-    avg_diff = sum(diffs) / len(diffs)
-    return avg_diff > 0.5  # if avg step change is large, not converging
+    # (a) stuck at 0
+    if len(accs) >= 3:
+        recent_accs = accs[-min(3, len(accs)):]
+        if all(a == 0.0 for a in recent_accs):
+            return True
+
+    # (b) plateau
+    if len(losses) >= window:
+        window_losses = losses[-window:]
+        oldest = window_losses[0]
+        newest = window_losses[-1]
+        if oldest > 0 and (oldest - newest) / oldest < PLATEAU_THRESHOLD:
+            return True
+
+    return False
 
 
 def find_worst_expert(model, dataset, config, bank_t_experts: list) -> int:
@@ -276,7 +299,7 @@ def train_phase(
             if verbose:
                 tag = f"[{bank_label} Bank]"
                 if is_math:
-                    ma = compute_math_accuracy(model, math_eval_dataset, config, 200)
+                    ma = compute_math_accuracy(model, math_eval_dataset, config, 50)
                     ppl = compute_perplexity(val_ce.item())
                     print(f"  {tag} Step {step:5d} | Loss: {val_ce.item():.4f} | "
                           f"CharAcc: {accuracy:.4f} | MathAcc: {ma:.4f} | PPL: {ppl:.2f}")
@@ -366,12 +389,13 @@ def run_adaptive_trainer(
 
         print(f"\n  Shakespeare final → Loss: {final_sh_loss:.4f} | Acc: {final_sh_acc:.4f}")
 
-        # ── Check: Shakespeare too easy? ──────────────────────────────
-        sh_too_easy = is_shakespeare_too_easy(sh_metrics)
+        # ── Check: Shakespeare converged? ──────────────────────────────
+        sh_converged = is_shakespeare_converged(sh_metrics)
 
-        if sh_too_easy and t_size > min_t_experts:
-            print(f"\n  ⚠️  Shakespeare too easy! (loss={final_sh_loss:.6f} < {THRESHOLD_EASY_LOSS})")
+        if sh_converged and t_size > min_t_experts:
+            old_loss = final_sh_loss
             worst = find_worst_expert(model, shakespeare_dataset, config, bank_t_experts)
+            print(f"\n  ⚠️  Shakespeare converged! (loss={old_loss:.6f}, plateau/improvement<{PLATEAU_THRESHOLD*100:.0f}%)")
             print(f"  → Moving worst expert {worst} from Bank T → Bank M")
 
             bank_t_experts = [e for e in bank_t_experts if e != worst]
@@ -380,8 +404,8 @@ def run_adaptive_trainer(
             print(f"  New: Bank T = {bank_t_experts}  |  Bank M = {bank_m_experts}")
             continue  # reset and retrain
 
-        elif sh_too_easy and t_size <= min_t_experts:
-            print(f"\n  Shakespeare too easy but Bank T at minimum ({min_t_experts}) — skip rebalance")
+        elif sh_converged and t_size <= min_t_experts:
+            print(f"\n  Shakespeare converged but Bank T at minimum ({min_t_experts}) — skip rebalance")
 
         # ── Phase 2: Train Math ────────────────────────────────────────
         print(f"\n[Phase {phase_num} — Math | Bank M active]")
@@ -401,32 +425,29 @@ def run_adaptive_trainer(
 
         print(f"\n  Math final → Loss: {final_math_loss:.4f} | Acc: {final_math_acc:.4f}")
 
-        # ── Check: Math too hard? ─────────────────────────────────────
-        math_too_hard = (final_math_acc <= DIVERGENCE_ACC_THRESH)
-        math_not_converging = is_math_not_converging(math_metrics)
+        # ── Check: Math converged? ─────────────────────────────────────
+        math_converged = is_math_converged(math_metrics)
 
-        if math_too_hard and len(bank_m_experts) > 1:
-            print(f"\n  ⚠️  Math too hard! (math_acc={final_math_acc:.4f})")
-            # Move best expert from Bank M → Bank T (give Math more capacity)
-            # Actually: move worst from M → T to reduce M burden
-            # OR move best from M → T to strengthen T for Math
-            # Decision: move WORST from M (least useful expert for Math)
-            worst_m = find_worst_expert(model, math_train, config, bank_m_experts)
-            print(f"  → Moving worst Bank M expert {worst_m} → Bank T")
-            bank_m_experts = [e for e in bank_m_experts if e != worst_m]
-            bank_t_experts = sorted(bank_t_experts + [worst_m])
+        if math_converged and len(bank_t_experts) > 1:
+            print(f"\n  ⚠️  Math converged (plateau/acc=0, improvement<{PLATEAU_THRESHOLD*100:.0f}%)!")
+            print(f"  → Moving worst Bank T expert → Bank M  (strengthen Bank M for math)")
+            worst_t = find_worst_expert(model, shakespeare_dataset, config, bank_t_experts)
+            bank_t_experts = [e for e in bank_t_experts if e != worst_t]
+            bank_m_experts = sorted(bank_m_experts + [worst_t])
             update_all_bank_config(model, bank_t_experts, bank_m_experts)
             print(f"  New: Bank T = {bank_t_experts}  |  Bank M = {bank_m_experts}")
             continue  # reset and retrain
+        elif math_converged and len(bank_t_experts) <= 1:
+            print(f"\n  Math converged but Bank T at minimum — cannot rebalance T→M")
 
-        # ── Check: Both stable? ────────────────────────────────────────
-        if not sh_too_easy and not math_too_hard and not math_not_converging:
-            print(f"\n  ✅ Both tasks converged. Stopping adaptive loop.")
+        # ── Check: Both stable (no rebalance needed)? ───────────────────
+        if not sh_converged and not math_converged:
+            print(f"\n  ✅ Both tasks still improving. Stopping adaptive loop.")
             break
 
         # Safety: prevent infinite loop
-        if phase_num >= 20:
-            print(f"\n  Safety limit (20 phases) reached. Stopping.")
+        if phase_num >= 5:
+            print(f"\n  Safety limit (5 phases) reached. Stopping.")
             break
 
     # ── Final inference evaluation ──────────────────────────────────────
@@ -440,6 +461,7 @@ def run_adaptive_trainer(
     with torch.no_grad():
         x_sh, y_sh = shakespeare_dataset[0]
         x_sh = x_sh.unsqueeze(0).to(config.device)
+        y_sh = y_sh.to(config.device)
         logits_sh, _ = model(x_sh)
         ppl_sh = compute_perplexity(
             F.cross_entropy(logits_sh.view(-1, 256), y_sh.view(-1), ignore_index=0).item()
