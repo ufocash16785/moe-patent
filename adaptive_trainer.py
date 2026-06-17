@@ -364,8 +364,8 @@ def run_adaptive_trainer(
     print("\n[Data]")
     shakespeare_data = download_shakespeare()
     shakespeare_dataset = TinyShakespeareDataset(shakespeare_data, config.max_seq_len, stride=64)
-    math_train = MathDataset(10000, config.max_seq_len, difficulty="medium")
-    math_eval  = MathDataset(500,   config.max_seq_len, difficulty="medium")
+    math_train = MathDataset(10000, config.max_seq_len, difficulty="easy")
+    math_eval  = MathDataset(500,   config.max_seq_len, difficulty="easy")
     print(f"  Shakespeare: {len(shakespeare_dataset):,} samples")
     print(f"  Math train:  {len(math_train):,} | eval: {len(math_eval):,}")
 
