@@ -461,35 +461,74 @@ class ContrastiveRouter(nn.Module):
 
 class BankConstrainedRouter(nn.Module):
     """
-    Bank‑constrained top‑2 router.
+    Bank‑constrained top‑2 router with DYNAMIC bank sizes.
+
+    Bank experts are stored as instance lists (not class constants), so they
+    can be updated at runtime to support dynamic rebalancing.
 
     Args:
-      hidden_states: [batch, seq, d_model]  (or [batch*seq, d_model])
-      active_bank:  None (inference) | 'T' (train Shakespeare) | 'M' (train Math)
+      config: MoEConfig
+      bank_t_experts: list of expert indices belonging to bank T
+      bank_m_experts: list of expert indices belonging to bank M
 
-    Inference behaviour:
+    Inference behaviour (active_bank=None):
       1. Compute softmax over all 8 experts
       2. Identify which bank top‑1 belongs to
-      3. Select top‑2 from that bank only (ignores cross‑bank top‑2)
+      3. Select top‑2 from that bank only
 
-    Training behaviour (active_bank set):
-      1. Zero out the inactive bank before softmax → it can never be selected
-      2. Top‑2 are naturally drawn from the active bank
+    Training behaviour (active_bank='T' or 'M'):
+      1. Zero out the inactive bank before softmax
+      2. Top‑2 drawn from the active bank only
     """
-    # Bank layout: bank T = experts 0‑3, bank M = experts 4‑7
-    BANK_T_EXPERTS = (0, 1, 2, 3)
-    BANK_M_EXPERTS = (4, 5, 6, 7)
-    NUM_EXPERTS_PER_BANK = 4
 
-    def __init__(self, config):
+    def __init__(self, config, bank_t_experts=None, bank_m_experts=None):
         super().__init__()
         self.num_experts = config.num_experts      # 8
         self.top_k = config.top_k                  # 2
         assert self.num_experts == 8
         assert self.top_k == 2
 
-        # ── Single shared gate (not separated by bank) ──────────────
+        # ── Dynamic bank configuration (can be updated for rebalancing) ──
+        # Defaults: bank T = 0-3, bank M = 4-7  (4+4 split)
+        if bank_t_experts is None:
+            bank_t_experts = [0, 1, 2, 3]
+        if bank_m_experts is None:
+            bank_m_experts = [4, 5, 6, 7]
+        self.bank_t_experts = bank_t_experts       # e.g. [0,1,2,3,4,5,6] or [0,1,2,3]
+        self.bank_m_experts = bank_m_experts       # e.g. [6,7]   or [4,5,6,7]
+
+        # ── Single shared gate ───────────────────────────────────────────
         self.gate = nn.Linear(config.d_model, self.num_experts, bias=False)
+
+    def set_banks(self, bank_t_experts: list, bank_m_experts: list):
+        """Update bank expert assignments (called during dynamic rebalancing)."""
+        self.bank_t_experts = list(bank_t_experts)
+        self.bank_m_experts = list(bank_m_experts)
+
+    def _masked_softmax(self, logits: torch.Tensor, active_experts: list) -> torch.Tensor:
+        """Softmax over all experts, zeroing out the inactive bank."""
+        masked = logits.clone()
+        all_experts = set(self.bank_t_experts + self.bank_m_experts)
+        inactive = all_experts - set(active_experts)
+        for e in inactive:
+            masked[:, e] = float('-inf')
+        return F.softmax(masked, dim=-1, dtype=torch.float32)
+
+    def _select_top2_from_bank(
+        self, routing_weights: torch.Tensor, bank_experts: list
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Select top-2 from the given bank_experts list.
+        Returns (top_weights [M, 2], top_indices [M, 2]).
+        """
+        bank_w = routing_weights[:, bank_experts]          # [M, k]
+        top_w, order = torch.topk(bank_w, min(len(bank_experts), self.top_k), dim=-1)
+        # Map local indices back to global expert indices
+        bank_idx_tensor = torch.tensor(bank_experts, device=routing_weights.device)
+        top_idx = bank_idx_tensor[order]                    # [M, top_k]
+        # Renormalise
+        top_w = top_w / (top_w.sum(dim=-1, keepdim=True) + 1e-9)
+        return top_w, top_idx
 
     def forward(
         self,
@@ -507,95 +546,53 @@ class BankConstrainedRouter(nn.Module):
             hidden_states = hidden_states.view(-1, hidden_states.size(-1))
         # [M, d_model]
 
-        # ── Raw logits for all 8 experts ─────────────────────────────
         router_logits = self.gate(hidden_states)      # [M, 8]
 
-        # ── Bank‑masked softmax ────────────────────────────────────────
         if active_bank == 'T':
-            # Training Shakespeare: only bank T (0‑3) can fire
-            mask_logits = router_logits.clone()
-            mask_logits[:, self.BANK_M_EXPERTS] = float('-inf')
-            routing_weights = F.softmax(mask_logits, dim=-1, dtype=torch.float32)
-
+            routing_weights = self._masked_softmax(router_logits, self.bank_t_experts)
         elif active_bank == 'M':
-            # Training Math: only bank M (4‑7) can fire
-            mask_logits = router_logits.clone()
-            mask_logits[:, self.BANK_T_EXPERTS] = float('-inf')
-            routing_weights = F.softmax(mask_logits, dim=-1, dtype=torch.float32)
-
+            routing_weights = self._masked_softmax(router_logits, self.bank_m_experts)
         else:
-            # Inference: normal softmax over all 8, then enforce bank constraint
+            # Inference: full softmax, then bank‑constrained top‑2
             routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
 
-            # ── Enforce bank constraint: top‑2 must be in same bank ──
-            bank_t_weights = routing_weights[:, self.BANK_T_EXPERTS]  # [M, 4]
-            bank_m_weights = routing_weights[:, self.BANK_M_EXPERTS]  # [M, 4]
-
-            # Top‑1 bank = bank with higher max weight
-            t_max = bank_t_weights.max(dim=-1, keepdim=True)[0]  # [M, 1]
-            m_max = bank_m_weights.max(dim=-1, keepdim=True)[0]  # [M, 1]
-            top1_bank_is_t = (t_max >= m_max).squeeze(-1)         # [M]
-
-            # Build constrained top‑2 weights & indices
-            constrained_w = torch.zeros_like(routing_weights)  # [M, 8]
-            constrained_idx = torch.zeros(
-                self.num_experts, dtype=torch.long, device=hidden_states.device
-            )
-            # For each bank, the indices are fixed: bank T → [0,1,2,3], M → [4,5,6,7]
-            bank_t_idx = torch.tensor(
-                self.BANK_T_EXPERTS, device=hidden_states.device
-            )
-            bank_m_idx = torch.tensor(
-                self.BANK_M_EXPERTS, device=hidden_states.device
-            )
+            # Which bank does top‑1 belong to?
+            t_w = routing_weights[:, self.bank_t_experts]   # [M, len_T]
+            m_w = routing_weights[:, self.bank_m_experts]   # [M, len_M]
+            t_max = t_w.max(dim=-1, keepdim=True)[0]       # [M, 1]
+            m_max = m_w.max(dim=-1, keepdim=True)[0]       # [M, 1]
+            top1_bank_is_t = (t_max >= m_max).squeeze(-1)  # [M] bool
 
             w_top2 = torch.zeros(hidden_states.size(0), 2,
-                                 device=hidden_states.device)
+                                 device=hidden_states.device, dtype=hidden_states.dtype)
             idx_top2 = torch.zeros(hidden_states.size(0), 2,
                                    dtype=torch.long, device=hidden_states.device)
 
-            # Tokens where top‑1 is in bank T
+            # Tokens whose top‑1 is in bank T
             t_mask = top1_bank_is_t
             if t_mask.any():
-                t_w_sorted, t_order = bank_t_weights[t_mask].sort(dim=-1, descending=True)
-                w_top2[t_mask, 0] = t_w_sorted[:, 0]
-                w_top2[t_mask, 1] = t_w_sorted[:, 1]
-                idx_top2[t_mask, 0] = bank_t_idx[t_order[:, 0]]
-                idx_top2[t_mask, 1] = bank_t_idx[t_order[:, 1]]
+                tw, ti = self._select_top2_from_bank(routing_weights[t_mask], self.bank_t_experts)
+                w_top2[t_mask] = tw
+                idx_top2[t_mask] = ti
 
-            # Tokens where top‑1 is in bank M
+            # Tokens whose top‑1 is in bank M
             m_mask = ~top1_bank_is_t
             if m_mask.any():
-                m_w_sorted, m_order = bank_m_weights[m_mask].sort(dim=-1, descending=True)
-                w_top2[m_mask, 0] = m_w_sorted[:, 0]
-                w_top2[m_mask, 1] = m_w_sorted[:, 1]
-                idx_top2[m_mask, 0] = bank_m_idx[m_order[:, 0]]
-                idx_top2[m_mask, 1] = bank_m_idx[m_order[:, 1]]
+                mw, mi = self._select_top2_from_bank(routing_weights[m_mask], self.bank_m_experts)
+                w_top2[m_mask] = mw
+                idx_top2[m_mask] = mi
 
-            # Renormalise so the two weights sum to 1
-            w_top2 = w_top2 / (w_top2.sum(dim=-1, keepdim=True) + 1e-9)
-            w_top2 = w_top2.to(hidden_states.dtype)
-
-            # router_logits stays as [M, 8] raw for aux loss
-            if len(orig_shape) == 3:
-                router_logits_out = router_logits.view(orig_shape[0], orig_shape[1], -1)
-            else:
-                router_logits_out = router_logits
-
+            router_logits_out = router_logits.view(*orig_shape[:2], -1) \
+                if len(orig_shape) == 3 else router_logits
             return w_top2, idx_top2, router_logits_out
 
-        # ── Training path (active_bank set) — standard top‑2 from active bank ──
+        # Training path (active_bank set) — standard top‑k from active bank
         top_weights, top_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        top_weights = top_weights / (
-            top_weights.sum(dim=-1, keepdim=True) + 1e-9
-        )
+        top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-9)
         top_weights = top_weights.to(hidden_states.dtype)
 
-        if len(orig_shape) == 3:
-            router_logits_out = router_logits.view(orig_shape[0], orig_shape[1], -1)
-        else:
-            router_logits_out = router_logits
-
+        router_logits_out = router_logits.view(*orig_shape[:2], -1) \
+            if len(orig_shape) == 3 else router_logits
         return top_weights, top_experts, router_logits_out
 
 
@@ -612,51 +609,51 @@ class BankConstrainedRouter(nn.Module):
 
 class BankedSparseMoEBlock(nn.Module):
     """
-    Bank‑aware MoE block with 8 experts in 2 banks of 4.
+    Bank‑aware MoE block with 8 experts in 2 banks (dynamic sizes).
+
+    Experts are stored in a single flat ModuleList [0..7].
+    Bank membership is determined by self.router.bank_t_experts / bank_m_experts.
 
     Active‑bank semantics:
-      None  → inference mode (bank‑constrained routing via BankConstrainedRouter)
-      'T'   → training Shakespeare: only bank T (experts 0‑3) active
-      'M'   → training Math:        only bank M (experts 4‑7) active
-
-    Usage:
-      SparseMoEBlock.router_class = BankConstrainedRouter
-      model = MoETransformer(config)
-      # ... train Shakespeare ...
-      model.set_active_bank('T')     # bank T active, bank M zeroed
-      # ... train Math ...
-      model.set_active_bank('M')     # bank M active, bank T zeroed
-      model.set_active_bank(None)    # back to inference (bank‑constrained)
+      None  → inference mode (bank‑constrained routing)
+      'T'   → training Shakespeare: only bank T active
+      'M'   → training Math:        only bank M active
     """
     router_class = BankConstrainedRouter
 
-    BANK_T_RANGE = (0, 1, 2, 3)
-    BANK_M_RANGE = (4, 5, 6, 7)
-
-    def __init__(self, config: MoEConfig):
+    def __init__(self, config: MoEConfig, bank_t_experts=None, bank_m_experts=None):
         super().__init__()
         self.num_experts = config.num_experts    # 8
         self.top_k = config.top_k                # 2
         self.d_model = config.d_model
         self.active_bank = None                  # None | 'T' | 'M'
 
-        # Router
-        self.router = BankConstrainedRouter(config)
+        # Default: 4+4 split
+        if bank_t_experts is None:
+            bank_t_experts = [0, 1, 2, 3]
+        if bank_m_experts is None:
+            bank_m_experts = [4, 5, 6, 7]
 
-        # Experts — two separate banks, each with 4 MLP experts
-        self.bank_t = nn.ModuleList([
+        # Router — initialise with bank configs
+        self.router = BankConstrainedRouter(config, bank_t_experts, bank_m_experts)
+
+        # All 8 experts in a single flat list (global index = list index)
+        self.experts = nn.ModuleList([
             ExpertMLP(config.d_model, config.d_ff)
-            for _ in range(4)
-        ])
-        self.bank_m = nn.ModuleList([
-            ExpertMLP(config.d_model, config.d_ff)
-            for _ in range(4)
+            for _ in range(self.num_experts)
         ])
 
     def set_active_bank(self, bank: str):
-        """Set which bank is active during training. None = inference mode."""
+        """Set active bank for training. None = inference (bank‑constrained)."""
         assert bank in (None, 'T', 'M'), f"bank must be None|'T'|'M', got {bank}"
         self.active_bank = bank
+
+    def update_bank_config(self, bank_t_experts: list, bank_m_experts: list):
+        """
+        Update bank expert assignments and reset the router to match.
+        Called during dynamic rebalancing.
+        """
+        self.router.set_banks(bank_t_experts, bank_m_experts)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -669,7 +666,7 @@ class BankedSparseMoEBlock(nn.Module):
         batch_size, seq_len, d_model = x.shape
         num_tokens = batch_size * seq_len
 
-        # ── Route (router handles bank masking / constraint internally) ──
+        # Route — router handles bank masking / constraint
         weights, expert_indices, router_logits = self.router(x, active_bank=self.active_bank)
         # weights:       [num_tokens, 2]
         # expert_indices:[num_tokens, 2]
@@ -678,34 +675,19 @@ class BankedSparseMoEBlock(nn.Module):
         x_flat = x.view(num_tokens, d_model)
         final_output = torch.zeros(num_tokens, d_model, device=x.device, dtype=x.dtype)
 
-        # ── Slot‑based dispatch (follows the standard MoE pattern) ──────────
-        # For each top‑k slot, route to the selected expert and weight by that slot's probability.
-        # This is the standard Mixtral / HuggingFace MoE dispatch — clean and correct.
+        # ── Slot‑based dispatch — uses global expert index directly ──────────
         for slot in range(self.top_k):
-            slot_experts = expert_indices[:, slot]         # [num_tokens]
-            slot_weights  = weights[:, slot]                # [num_tokens]
+            slot_experts = expert_indices[:, slot]   # [num_tokens]
+            slot_weights  = weights[:, slot]          # [num_tokens]
 
-            # ── Bank T experts (0‑3) ──────────────────────────────────────
-            if self.active_bank != 'M':   # active when 'T' or None (inference)
-                for local_idx, global_idx in enumerate(self.BANK_T_RANGE):
-                    mask = (slot_experts == global_idx)   # [num_tokens]
-                    if not mask.any():
-                        continue
-                    expert_input  = x_flat[mask]
-                    expert_output  = self.bank_t[local_idx](expert_input)
-                    w = slot_weights[mask].unsqueeze(-1)  # [n_selected, 1]
-                    final_output[mask] += expert_output * w
-
-            # ── Bank M experts (4‑7) ─────────────────────────────────────
-            if self.active_bank != 'T':   # active when 'M' or None (inference)
-                for local_idx, global_idx in enumerate(self.BANK_M_RANGE):
-                    mask = (slot_experts == global_idx)   # [num_tokens]
-                    if not mask.any():
-                        continue
-                    expert_input  = x_flat[mask]
-                    expert_output  = self.bank_m[local_idx](expert_input)
-                    w = slot_weights[mask].unsqueeze(-1)  # [n_selected, 1]
-                    final_output[mask] += expert_output * w
+            for global_idx in range(self.num_experts):
+                mask = (slot_experts == global_idx)
+                if not mask.any():
+                    continue
+                expert_input  = x_flat[mask]
+                expert_output = self.experts[global_idx](expert_input)
+                w = slot_weights[mask].unsqueeze(-1)  # [n, 1]
+                final_output[mask] += expert_output * w
 
         final_output = final_output.view(batch_size, seq_len, d_model)
         return final_output, router_logits
