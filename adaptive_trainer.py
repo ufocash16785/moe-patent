@@ -307,8 +307,16 @@ def train_phase(
                 if is_math:
                     ma = compute_math_accuracy(model, math_eval_dataset, config, 50)
                     ppl = compute_perplexity(val_ce.item())
+                    trend = ""
+                    if len(metrics["loss"]) >= 2:
+                        prev = metrics["loss"][-2]
+                        curr = val_ce.item()
+                        if curr > prev * 1.01:
+                            trend = "  ⚠️ worsening"
+                        elif curr < prev * 0.99:
+                            trend = "  ↓ improving"
                     print(f"  {tag} Step {step:5d} | Loss: {val_ce.item():.4f} | "
-                          f"CharAcc: {accuracy:.4f} | MathAcc: {ma:.4f} | PPL: {ppl:.2f}")
+                          f"CharAcc: {accuracy:.4f} | MathAcc: {ma:.4f} | PPL: {ppl:.2f}{trend}")
                 else:
                     ppl = compute_perplexity(val_ce.item())
                     print(f"  {tag} Step {step:5d} | Loss: {val_ce.item():.4f} | "
@@ -387,6 +395,7 @@ def run_adaptive_trainer(
 
         # ── Phase 1: Train Shakespeare ─────────────────────────────────
         print(f"\n[Phase {phase_num} — Shakespeare | Bank T active]")
+        print(f"  Current banks → Bank T: {bank_t_experts}  |  Bank M: {bank_m_experts}")
         sh_metrics, sh_early = train_phase(
             model, config, shakespeare_dataset,
             bank_label='T', active_bank='T',
@@ -422,6 +431,7 @@ def run_adaptive_trainer(
 
         # ── Phase 2: Train Math ────────────────────────────────────────
         print(f"\n[Phase {phase_num} — Math | Bank M active]")
+        print(f"  Current banks → Bank T: {bank_t_experts}  |  Bank M: {bank_m_experts}")
         math_metrics, math_early = train_phase(
             model, config, math_train,
             bank_label='M', active_bank='M',
